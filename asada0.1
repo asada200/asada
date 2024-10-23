@@ -1,0 +1,173 @@
+import cv2
+import pytesseract
+import pandas as pd
+from datetime import datetime, timedelta
+from ultralytics import YOLO
+import signal
+import sys
+import os  # Import for file management
+import matplotlib.pyplot as plt
+import subprocess  # Add this for opening the file in Linux
+import smbus2  # For I2C communication with the LCD
+from RPLCD.i2c import CharLCD
+
+# Path to Tesseract (update this path based on your installation)
+pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'  # Adjusted path
+
+# Initialize YOLO model
+model = YOLO("model/pea.pt", task='detect')
+classNames = ['meter', 'box', 'PEA', 'Num', 'PEAN']
+
+# Create an empty DataFrame to store the data
+df = pd.DataFrame(columns=['Number', 'Meter', 'Time'])
+
+# Dictionary to store the last recorded time for each number
+number_last_recorded_time = {}
+
+# Cooldown duration in seconds for each number
+cooldown_duration = 5  # Adjust this as needed
+
+# Initialize webcam
+cap = cv2.VideoCapture(0)  # Use 0 for the default webcam
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Set width
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # Set height
+
+# Set the processing interval (e.g., every 5th frame)
+frame_skip = 5
+frame_count = 0
+
+# Directory for saving the detected images
+output_dir = '/home/asada08820/meter/meter_project2/output_images'
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# Path to save the Excel file
+output_file_path = '/home/asada08820/meter/meter_project2/result/detected_numbers_real_time.xlsx'
+
+# Initialize LCD (I2C address might differ; use i2cdetect -y 1 to check)
+lcd = CharLCD('PCF8574', 0x27)  # Adjust the I2C address if necessary
+lcd.clear()
+
+def display_on_lcd(meter, num):
+    """Helper function to display text on the LCD."""
+    lcd.clear()  # Clear the screen before writing
+    lcd.write_string(f"Meter: {meter}")
+    lcd.crlf()  # Move to next line
+    lcd.write_string(f"Num: {num}")
+
+def save_to_excel():
+    """Save the DataFrame to Excel in real-time."""
+    try:
+        df.to_excel(output_file_path, index=False)
+        print(f"Data saved to {output_file_path}")
+    except Exception as e:
+        print("Error occurred while saving the Excel file:", e)
+
+def save_and_exit(signal, frame):
+    current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    final_output_file = f'/home/asada08820/meter/meter_project2/result/detected_numbers_{current_datetime}.xlsx'
+    try:
+        # Save the DataFrame to a final Excel file
+        df.to_excel(final_output_file, index=False)
+        print(f"File saved successfully at {final_output_file}!")
+        
+        # Open the Excel file (Linux version)
+        subprocess.Popen(["xdg-open", final_output_file])
+        
+    except Exception as e:
+        print("Error occurred while saving the file:", e)
+    cap.release()  # Release the webcam
+    plt.close()  # Close the matplotlib window
+    lcd.clear()  # Clear the LCD screen
+    sys.exit(0)
+
+# Register signal handler for Ctrl+C
+signal.signal(signal.SIGINT, save_and_exit)
+
+# Create a figure for displaying the camera feed
+plt.ion()  # Enable interactive mode
+fig, ax = plt.subplots()
+
+while True:
+    ret, img = cap.read()  # Read a frame from the webcam
+    if not ret:
+        print("Failed to capture image from webcam.")
+        break
+
+    # Process every 'frame_skip' frames to reduce lag
+    if frame_count % frame_skip == 0:
+        results = model(img, stream=True)
+
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                cls = int(box.cls[0])
+                if classNames[cls] == 'Num' and box.conf[0] >= 0.5:
+                    x1, y1, x2, y2 = box.xyxy[0]
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+
+                    # Apply padding to the bounding box
+                    padding = 5
+                    x1 = max(0, x1 - padding)
+                    y1 = max(0, y1 - padding)
+                    x2 = min(img.shape[1], x2 + padding)
+                    y2 = min(img.shape[0], y2 + padding)
+
+                    roi = img[y1:y2, x1:x2]
+
+                    custom_config = r'--oem 3 --psm 6'
+
+                    # Error handling during OCR process
+                    try:
+                        text = pytesseract.image_to_string(roi, config=custom_config)
+                        text = ''.join(filter(str.isdigit, text))  # Extract digits only
+                    except Exception as e:
+                        print(f"Error during OCR: {e}")
+                        text = ''  # Handle the case where OCR fails
+
+                    if text:
+                        current_time = datetime.now()
+                        meter = classNames[cls - 1] if cls > 0 else 'Unknown'
+
+                        # Check if the number has been previously detected and verify the cooldown period
+                        if text in number_last_recorded_time:
+                            last_recorded_time = number_last_recorded_time[text]
+                            cooldown_time = last_recorded_time + timedelta(seconds=cooldown_duration)
+
+                            if current_time >= cooldown_time:
+                                number_last_recorded_time[text] = current_time
+                                new_row = pd.DataFrame({'Number': [text], 'Meter': [meter], 'Time': [current_time]})
+                                df = pd.concat([df, new_row], ignore_index=True)
+                                display_on_lcd(meter, text)  # Display on LCD with new format
+                                save_to_excel()  # Save to Excel in real-time
+                        else:
+                            number_last_recorded_time[text] = current_time
+                            new_row = pd.DataFrame({'Number': [text], 'Meter': [meter], 'Time': [current_time]})
+                            df = pd.concat([df, new_row], ignore_index=True)
+                            display_on_lcd(meter, text)  # Display on LCD with new format
+                            save_to_excel()  # Save to Excel in real-time
+
+                        # Draw a rectangle and label around the detected number
+                        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), 1)
+                        font_scale = 1.0
+                        font_thickness = 2
+                        text_x = x1
+                        text_y = y1 - 10
+                        cv2.putText(img, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness, cv2.LINE_AA)
+
+                        # Save the detected frame to the output directory
+                        img_filename = os.path.join(output_dir, f"output_frame_{frame_count}.jpg")
+                        cv2.imwrite(img_filename, img)
+                        print(f"Image saved at {img_filename}")
+
+    # Increment frame count
+    frame_count += 1
+
+    # Display the image using matplotlib
+    ax.clear()  # Clear previous image
+    ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))  # Convert BGR to RGB
+    ax.axis('off')  # Hide axis
+    plt.pause(0.001)  # Pause to update the plot
+
+# Call to save and exit before the program finishes
+save_and_exit(None, None)
